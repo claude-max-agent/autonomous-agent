@@ -26,7 +26,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 # ─── 設定 ──────────────────────────────────────────────────────────────────
 HUB_API_URL = os.getenv("HUB_API_URL", "http://localhost:8080")
-DISCORD_CHANNEL = "hub-autonomous"
+DISCORD_CHANNEL = os.getenv("DISCORD_CHANNEL_ID", "1475499842800451616")
 AGENT_NAME = "autonomous-agent"
 MAX_DAILY_ACTIONS = 50
 
