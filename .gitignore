@@ -1,0 +1,43 @@
+# 環境変数・シークレット
+.env.autonomous
+.env
+
+# ===========================
+# 個人データ（絶対にgit管理しない）
+# ===========================
+
+# 生データ（Twitterアーカイブ・Chrome履歴等）
+data/raw/**
+!data/raw/**/
+!data/raw/**/.gitkeep
+
+# 前処理済みデータ（個人情報を含む可能性）
+data/processed/**
+!data/processed/**/
+!data/processed/**/.gitkeep
+
+# ベクトルDB（大容量 + 個人情報）
+data/embeddings/**
+!data/embeddings/
+!data/embeddings/.gitkeep
+
+# ===========================
+# ランタイム・ビルド成果物
+# ===========================
+
+# ログ
+logs/*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
