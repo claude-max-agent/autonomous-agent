@@ -473,25 +473,42 @@ if __name__ == "__main__":
         llm_status = "🧠 LLM: Claude API のみ（Ollama未起動）"
         post_diary("Ollama が利用不可のため、Claude APIのみで動作します。", step="startup")
 
-    notify_discord(f"🤖 autonomous_agent が起動しました。毎朝 08:00 にリサーチを実行します。\n{llm_status}")
-    post_diary("起動しました。思考ログをここに記録していきます。", step="startup")
+    # スケジュール設定: INTERVAL_MINUTES 環境変数が設定されていればインターバル実行
+    interval_minutes = os.getenv("INTERVAL_MINUTES")
 
     scheduler = BlockingScheduler(timezone="Asia/Tokyo")
-    scheduler.add_job(
-        daily_research,
-        trigger="cron",
-        hour=8,
-        minute=0,
-        id="daily_research",
-        name="毎朝リサーチ投稿",
-    )
+
+    if interval_minutes:
+        interval_minutes = int(interval_minutes)
+        scheduler.add_job(
+            daily_research,
+            trigger="interval",
+            minutes=interval_minutes,
+            id="daily_research",
+            name=f"{interval_minutes}分ごとリサーチ（テスト）",
+        )
+        schedule_desc = f"⏱️ {interval_minutes}分間隔（テストモード）"
+        log.info(f"スケジューラ起動: {interval_minutes}分ごと（テストモード）")
+    else:
+        scheduler.add_job(
+            daily_research,
+            trigger="cron",
+            hour=8,
+            minute=0,
+            id="daily_research",
+            name="毎朝リサーチ投稿",
+        )
+        schedule_desc = "📅 毎朝 08:00 JST"
+        log.info("スケジューラ起動: 毎朝 08:00 JST")
+
+    notify_discord(f"🤖 autonomous_agent が起動しました。{schedule_desc} にリサーチを実行します。\n{llm_status}")
+    post_diary("起動しました。思考ログをここに記録していきます。", step="startup")
 
     # 起動時に即時実行するオプション（テスト用）
     if os.getenv("RUN_NOW") == "1":
         log.info("RUN_NOW=1 検出: 即時実行します")
         daily_research()
 
-    log.info("スケジューラ起動: 毎朝 08:00 JST")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
