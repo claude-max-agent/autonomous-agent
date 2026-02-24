@@ -27,9 +27,13 @@ import json
 import logging
 from datetime import datetime, date
 
+import signal
+import threading
+
 import httpx
 import anthropic
 from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.executors.pool import ThreadPoolExecutor
 
 # ─── 設定 ──────────────────────────────────────────────────────────────────
 HUB_API_URL = os.getenv("HUB_API_URL", "http://localhost:8080")
@@ -489,54 +493,70 @@ def poll_chat_messages() -> None:
 # ─── メインタスク ────────────────────────────────────────────────────────────
 
 def daily_research():
-    """毎朝08:00に実行されるメインタスク"""
+    """毎朝08:00に実行されるメインタスク。
+    全体をtry/exceptで囲み、未処理例外によるスレッドプール崩壊を防止。"""
     global action_count
-    action_count = 0  # 日次リセット
+    try:
+        action_count = 0  # 日次リセット
 
-    today = date.today().isoformat()
-    topics = get_today_topics()
-    log.info(f"=== 毎朝リサーチ開始: {today} / テーマ: {topics} ===")
-    notify_discord(f"🌅 毎朝リサーチ開始\n日付: {today}\nトピック: {topics}")
+        today = date.today().isoformat()
+        topics = get_today_topics()
+        log.info(f"=== 毎朝リサーチ開始: {today} / テーマ: {topics} ===")
+        notify_discord(f"🌅 毎朝リサーチ開始\n日付: {today}\nトピック: {topics}")
 
-    # observe
-    context = observe(topics)
+        # observe
+        context = observe(topics)
 
-    # think
-    theme = think(context)
-    if not theme:
-        notify_discord("⚠️ テーマ選定に失敗しました。本日の処理を中断します。", is_alert=True)
-        return
+        # think
+        theme = think(context)
+        if not theme:
+            notify_discord("⚠️ テーマ選定に失敗しました。本日の処理を中断します。", is_alert=True)
+            return
 
-    # act
-    draft = act(theme, context)
-    if not draft:
-        notify_discord("⚠️ 記事草稿生成に失敗しました。", is_alert=True)
-        return
+        # act
+        draft = act(theme, context)
+        if not draft:
+            notify_discord("⚠️ 記事草稿生成に失敗しました。", is_alert=True)
+            return
 
-    # reflect
-    evaluation = reflect(draft, theme)
+        # reflect
+        evaluation = reflect(draft, theme)
 
-    # notify
-    score = evaluation.get("total", "?")
-    comment = evaluation.get("comment", "")
-    notify_discord(
-        f"✅ 本日のリサーチ投稿完了\n"
-        f"テーマ: {theme}\n"
-        f"品質スコア: {score}/100（{comment}）\n\n"
-        f"---\n{draft[:1500]}\n\n"
-        f"{'...(続き省略)' if len(draft) > 1500 else ''}"
-    )
-    log.info(f"=== 毎朝リサーチ完了: スコア{score} ===")
+        # notify
+        score = evaluation.get("total", "?")
+        comment = evaluation.get("comment", "")
+        notify_discord(
+            f"✅ 本日のリサーチ投稿完了\n"
+            f"テーマ: {theme}\n"
+            f"品質スコア: {score}/100（{comment}）\n\n"
+            f"---\n{draft[:1500]}\n\n"
+            f"{'...(続き省略)' if len(draft) > 1500 else ''}"
+        )
+        log.info(f"=== 毎朝リサーチ完了: スコア{score} ===")
 
-    # agent-diary: 日次まとめ
-    post_diary(
-        f"本日のリサーチ完了\n"
-        f"テーマ: {theme}\n"
-        f"品質スコア: {score}/100\n"
-        f"所感: {comment}\n"
-        f"明日への改善点: {'独自考察を増やす' if isinstance(score, int) and score < 80 else 'このクオリティを維持'}",
-        step="daily",
-    )
+        # agent-diary: 日次まとめ
+        post_diary(
+            f"本日のリサーチ完了\n"
+            f"テーマ: {theme}\n"
+            f"品質スコア: {score}/100\n"
+            f"所感: {comment}\n"
+            f"明日への改善点: {'独自考察を増やす' if isinstance(score, int) and score < 80 else 'このクオリティを維持'}",
+            step="daily",
+        )
+    except Exception as e:
+        log.error(f"daily_research 未処理例外: {e}", exc_info=True)
+        try:
+            notify_discord(f"⚠️ daily_research で未処理例外が発生: {e}", is_alert=True)
+        except Exception:
+            pass
+
+
+# ─── ヘルスチェック ─────────────────────────────────────────────────────────
+
+def scheduler_heartbeat():
+    """スケジューラの生存確認（5分ごと）。スレッド数をログに記録。"""
+    thread_count = threading.active_count()
+    log.info(f"💓 heartbeat: threads={thread_count}, pid={os.getpid()}")
 
 
 # ─── エントリポイント ────────────────────────────────────────────────────────
@@ -557,7 +577,20 @@ if __name__ == "__main__":
     # スケジュール設定: INTERVAL_MINUTES 環境変数が設定されていればインターバル実行
     interval_minutes = os.getenv("INTERVAL_MINUTES")
 
-    scheduler = BlockingScheduler(timezone="Asia/Tokyo")
+    # APScheduler: 明示的なExecutor設定でスレッドプール崩壊を防止
+    executors = {
+        "default": ThreadPoolExecutor(max_workers=10),
+    }
+    job_defaults = {
+        "coalesce": True,          # 複数misfireを1回に統合
+        "max_instances": 1,         # 同一ジョブの同時実行防止
+        "misfire_grace_time": 300,  # 5分以内のmisfireは実行を許可
+    }
+    scheduler = BlockingScheduler(
+        timezone="Asia/Tokyo",
+        executors=executors,
+        job_defaults=job_defaults,
+    )
 
     if interval_minutes:
         interval_minutes = int(interval_minutes)
@@ -592,6 +625,16 @@ if __name__ == "__main__":
     )
     log.info("agent-chat ポーリング: 30秒間隔で起動")
 
+    # ヘルスチェック: 5分ごとにスレッド数をログ出力
+    scheduler.add_job(
+        scheduler_heartbeat,
+        trigger="interval",
+        minutes=5,
+        id="heartbeat",
+        name="スケジューラ heartbeat",
+    )
+    log.info("heartbeat: 5分間隔で起動")
+
     notify_discord(f"🤖 autonomous_agent が起動しました。{schedule_desc} にリサーチを実行します。\n{llm_status}\n💬 agent-chat: 30秒ポーリングで対話受付中")
     post_diary("起動しました。思考ログをここに記録していきます。", step="startup")
 
@@ -599,6 +642,13 @@ if __name__ == "__main__":
     if os.getenv("RUN_NOW") == "1":
         log.info("RUN_NOW=1 検出: 即時実行します")
         daily_research()
+
+    # シグナルハンドラ: graceful shutdown
+    def handle_signal(signum, frame):
+        log.info(f"シグナル {signum} 受信、スケジューラ停止中...")
+        scheduler.shutdown(wait=False)
+
+    signal.signal(signal.SIGTERM, handle_signal)
 
     try:
         scheduler.start()
