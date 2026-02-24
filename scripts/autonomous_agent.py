@@ -16,11 +16,13 @@ LLM（ハイブリッド構成 - Issue #1）:
   - 破壊的操作（git push, file delete等）は実行しない
 
 チャンネル:
-  - hub-autonomous (DISCORD_CHANNEL_ID) : メインアクション結果の通知
-  - agent-diary   (DIARY_CHANNEL_ID)    : 思考プロセス・内省・独り言（Issue #9）
+  - hub-autonomous (DISCORD_CHANNEL_ID)    : メインアクション結果の通知
+  - agent-diary   (DIARY_CHANNEL_ID)       : 思考プロセス・内省・独り言（Issue #9）
+  - agent-chat    (AGENT_CHAT_CHANNEL_ID)  : Admin直接対話（qwen3:8b応答、Issue #18）
 """
 
 import os
+import glob
 import json
 import logging
 from datetime import datetime, date
@@ -33,8 +35,10 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 HUB_API_URL = os.getenv("HUB_API_URL", "http://localhost:8080")
 DISCORD_CHANNEL = os.getenv("DISCORD_CHANNEL_ID", "1475499842800451616")   # hub-autonomous
 DIARY_CHANNEL   = os.getenv("DIARY_CHANNEL_ID",   "1475552269222154312")   # agent-diary (Issue #9)
+CHAT_CHANNEL    = os.getenv("AGENT_CHAT_CHANNEL_ID", "1475867265110114379") # agent-chat (Issue #18)
 AGENT_NAME = "autonomous-agent"
 MAX_DAILY_ACTIONS = 50
+AGENT_CHAT_DIR = "/tmp/autonomous-agent-chat"  # Go APIがここにchatメッセージを書き込む
 
 # Ollama設定（Issue #1: ローカルLLM）
 OLLAMA_URL   = os.getenv("OLLAMA_URL",   "http://localhost:11434")
@@ -405,6 +409,83 @@ def reflect(draft: str, theme: str) -> dict:
     return result
 
 
+# ─── agent-chat ハンドラ（Issue #18）────────────────────────────────────────
+
+def chat_handler(message: str, sender: str, reply_channel_id: str) -> None:
+    """agent-chat チャンネルからのメッセージを qwen3:8b で処理して返信"""
+    log.info(f"💬 chat_handler: {sender}: {message[:80]}")
+
+    prompt = (
+        f"{sender} からメッセージが届きました。\n\n"
+        f"メッセージ:\n{message}\n\n"
+        "日本語で簡潔かつ的確に回答してください。"
+    )
+
+    try:
+        if LocalLLM.is_available():
+            response = LocalLLM.generate(prompt, max_tokens=800)
+            llm_label = f"qwen3:8b"
+        else:
+            # Claude Haiku フォールバック
+            resp = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=800,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            response = resp.content[0].text.strip()
+            llm_label = "Claude Haiku (fallback)"
+    except Exception as e:
+        log.error(f"chat_handler LLM error: {e}")
+        response = f"⚠️ エラーが発生しました: {e}"
+        llm_label = "error"
+
+    # agent-chat チャンネルに返信
+    try:
+        httpx.post(
+            f"{HUB_API_URL}/api/v1/discord/reply",
+            json={
+                "channel_id": reply_channel_id,
+                "message": f"💬 [{llm_label}] {response}",
+                "sender_name": AGENT_NAME,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        log.warning(f"chat_handler Discord返信失敗: {e}")
+
+    post_diary(f"**{sender}**: {message[:100]}\n→ {response[:200]}", step="think")
+
+
+def poll_chat_messages() -> None:
+    """agent-chat ディレクトリの未処理メッセージを処理する（APScheduler定期ジョブ）"""
+    if not os.path.isdir(AGENT_CHAT_DIR):
+        return
+
+    files = sorted(glob.glob(f"{AGENT_CHAT_DIR}/chat-*.json"))
+    if not files:
+        return
+
+    log.info(f"💬 chat poll: {len(files)} 件のメッセージ")
+    for fpath in files:
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            sender     = data.get("sender", "Admin")
+            content    = data.get("content", "")
+            channel_id = data.get("channel_id", CHAT_CHANNEL)
+
+            if content:
+                chat_handler(content, sender, channel_id)
+
+            os.remove(fpath)
+        except Exception as e:
+            log.error(f"chat poll error ({fpath}): {e}")
+            try:
+                os.remove(fpath)   # 壊れたファイルは削除して進む
+            except Exception:
+                pass
+
+
 # ─── メインタスク ────────────────────────────────────────────────────────────
 
 def daily_research():
@@ -501,7 +582,17 @@ if __name__ == "__main__":
         schedule_desc = "📅 毎朝 08:00 JST"
         log.info("スケジューラ起動: 毎朝 08:00 JST")
 
-    notify_discord(f"🤖 autonomous_agent が起動しました。{schedule_desc} にリサーチを実行します。\n{llm_status}")
+    # agent-chat ポーリング: 30秒ごとに未処理メッセージをチェック（Issue #18）
+    scheduler.add_job(
+        poll_chat_messages,
+        trigger="interval",
+        seconds=30,
+        id="poll_chat",
+        name="agent-chat ポーリング",
+    )
+    log.info("agent-chat ポーリング: 30秒間隔で起動")
+
+    notify_discord(f"🤖 autonomous_agent が起動しました。{schedule_desc} にリサーチを実行します。\n{llm_status}\n💬 agent-chat: 30秒ポーリングで対話受付中")
     post_diary("起動しました。思考ログをここに記録していきます。", step="startup")
 
     # 起動時に即時実行するオプション（テスト用）
