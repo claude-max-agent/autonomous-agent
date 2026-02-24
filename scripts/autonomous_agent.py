@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-autonomous_agent.py - 毎朝リサーチ投稿デーモン (Phase 1)
+autonomous_agent.py - 毎朝リサーチ投稿デーモン (Phase 2)
 
 スケジュール: 毎朝 08:00
 フロー: observe → think → act → reflect → notify
 
-LLM:
-  - claude-haiku-4-5  : 軽量タスク（トレンド収集・テーマ選定）
-  - claude-sonnet-4-6 : 重要タスク（記事草稿生成・自己評価）
+LLM（ハイブリッド構成 - Issue #1）:
+  - Ollama / qwen3:8b : 軽量タスク優先（テーマ選定・自己評価）
+  - claude-haiku-4-5  : Ollama不可時のフォールバック
+  - claude-sonnet-4-6 : 複雑タスク専用（記事草稿生成）
 
 安全設計:
   - 日次アクション上限: 50回
@@ -34,6 +35,10 @@ DISCORD_CHANNEL = os.getenv("DISCORD_CHANNEL_ID", "1475499842800451616")   # hub
 DIARY_CHANNEL   = os.getenv("DIARY_CHANNEL_ID",   "1475552269222154312")   # agent-diary (Issue #9)
 AGENT_NAME = "autonomous-agent"
 MAX_DAILY_ACTIONS = 50
+
+# Ollama設定（Issue #1: ローカルLLM）
+OLLAMA_URL   = os.getenv("OLLAMA_URL",   "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 
 # リサーチトピック（曜日で交互）
 # 月・水・金 = Web3, 火・木・土 = AI, 日 = 両方
@@ -105,6 +110,38 @@ def post_diary(content: str, step: str = "think") -> None:
         log.debug(f"Diary posted [{step}]: {content[:60]}")
     except Exception as e:
         log.warning(f"Diary投稿失敗: {e}")
+
+
+# ─── ローカルLLM（Ollama）─────────────────────────────────────────────────
+
+class LocalLLM:
+    """Ollama ローカルLLMクライアント（Issue #1）"""
+
+    @staticmethod
+    def is_available() -> bool:
+        """Ollamaサーバーが稼働中か確認"""
+        try:
+            r = httpx.get(f"{OLLAMA_URL}/api/tags", timeout=3)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    @staticmethod
+    def generate(prompt: str, max_tokens: int = 500) -> str:
+        """ローカルLLM（qwen3:8b）で推論。think:false でシンキングモード無効化"""
+        resp = httpx.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "think": False,   # qwen3のシンキングモードを無効化（高速化）
+                "options": {"num_predict": max_tokens, "temperature": 0.7},
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return resp.json()["response"].strip()
 
 
 def count_action(label: str) -> bool:
@@ -205,11 +242,10 @@ def observe(topics: str) -> dict:
 # ─── think ──────────────────────────────────────────────────────────────────
 
 def think(context: dict) -> str:
-    """Claude Haiku でテーマを選定"""
+    """テーマ選定: Ollama優先、Claude Haikuフォールバック（Issue #1）"""
     if not count_action("think: テーマ選定"):
         return ""
 
-    log.info("=== [think] テーマ選定 (claude-haiku-4-5) ===")
     prompt = f"""今日のリサーチテーマを1つ選定してください。
 
 対象トピック: {context['topics']}
@@ -224,13 +260,26 @@ GitHub 注目リポジトリ:
 上記を踏まえ、Zenn記事として最も価値が高いと思われるテーマを1行で答えてください。
 形式: 「テーマ: <テーマ名>（理由: <50字以内>）」"""
 
+    # Ollama優先
+    if LocalLLM.is_available():
+        log.info(f"=== [think] テーマ選定 (ollama: {OLLAMA_MODEL}) ===")
+        try:
+            theme = LocalLLM.generate(prompt, max_tokens=200)
+            log.info(f"選定テーマ (Ollama): {theme}")
+            post_diary(f"{theme}", step="think")
+            return theme
+        except Exception as e:
+            log.warning(f"Ollama失敗、Claude Haikuにフォールバック: {e}")
+
+    # Claude Haiku フォールバック
+    log.info("=== [think] テーマ選定 (claude-haiku-4-5) ===")
     resp = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=200,
         messages=[{"role": "user", "content": prompt}],
     )
     theme = resp.content[0].text.strip()
-    log.info(f"選定テーマ: {theme}")
+    log.info(f"選定テーマ (Claude): {theme}")
 
     # agent-diary: テーマ選定の思考プロセス
     post_diary(f"{theme}", step="think")
@@ -275,17 +324,31 @@ frontmatterのtopicsは実際のZennタグ名（英小文字）を使うこと�
 # ─── reflect ────────────────────────────────────────────────────────────────
 
 def reflect(draft: str, theme: str) -> dict:
-    """草稿の品質を自己評価"""
+    """草稿の品質を自己評価: Ollama優先、Claude Haikuフォールバック（Issue #1）"""
     if not draft or not count_action("reflect: 自己評価"):
         return {"score": 0, "comment": "スキップ"}
 
-    log.info("=== [reflect] 自己評価 (claude-haiku-4-5) ===")
-    prompt = f"""以下のZenn記事草稿を評価してください。
+    # Ollama用は短縮版（500字）、Claude用はフル版（2000字）
+    draft_short = draft[:500]
+    draft_full  = draft[:2000]
+
+    prompt_ollama = f"""以下のZenn記事草稿を評価してください。
 
 テーマ: {theme}
 
 ---
-{draft[:2000]}
+{draft_short}
+---
+
+以下の観点で100点満点で採点し、JSON形式のみで返してください:
+形式: {{"coherence": N, "originality": N, "readability": N, "accuracy": N, "total": N, "comment": "一言コメント"}}"""
+
+    prompt_claude = f"""以下のZenn記事草稿を評価してください。
+
+テーマ: {theme}
+
+---
+{draft_full}
 ---
 
 以下の観点で100点満点で採点し、JSON形式で返してください:
@@ -296,12 +359,27 @@ def reflect(draft: str, theme: str) -> dict:
 
 形式: {{"coherence": N, "originality": N, "readability": N, "accuracy": N, "total": N, "comment": "一言コメント"}}"""
 
-    resp = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = resp.content[0].text.strip()
+    text = ""
+    # Ollama優先（短縮プロンプトで高速評価）
+    if LocalLLM.is_available():
+        log.info(f"=== [reflect] 自己評価 (ollama: {OLLAMA_MODEL}) ===")
+        try:
+            text = LocalLLM.generate(prompt_ollama, max_tokens=150)
+            log.info(f"自己評価応答 (Ollama): {text[:100]}")
+        except Exception as e:
+            log.warning(f"Ollama失敗、Claude Haikuにフォールバック: {e}")
+            text = ""
+
+    # Claude Haiku フォールバック
+    if not text:
+        log.info("=== [reflect] 自己評価 (claude-haiku-4-5) ===")
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt_claude}],
+        )
+        text = resp.content[0].text.strip()
+
     try:
         # JSONブロックを抽出
         start = text.find("{")
@@ -384,7 +462,18 @@ def daily_research():
 
 if __name__ == "__main__":
     log.info("autonomous_agent 起動")
-    notify_discord("🤖 autonomous_agent が起動しました。毎朝 08:00 にリサーチを実行します。")
+
+    # Ollama可用性チェック（Issue #1）
+    if LocalLLM.is_available():
+        log.info(f"✅ Ollama 利用可能: {OLLAMA_URL} / モデル: {OLLAMA_MODEL}")
+        llm_status = f"🧠 LLM: Ollama ({OLLAMA_MODEL}) + Claude Sonnet (ハイブリッド)"
+        post_diary(f"Ollama ({OLLAMA_MODEL}) が利用可能です。ローカルLLMで軽量タスクを実行します。", step="startup")
+    else:
+        log.warning(f"⚠️ Ollama 利用不可。Claude APIのみで動作します。")
+        llm_status = "🧠 LLM: Claude API のみ（Ollama未起動）"
+        post_diary("Ollama が利用不可のため、Claude APIのみで動作します。", step="startup")
+
+    notify_discord(f"🤖 autonomous_agent が起動しました。毎朝 08:00 にリサーチを実行します。\n{llm_status}")
     post_diary("起動しました。思考ログをここに記録していきます。", step="startup")
 
     scheduler = BlockingScheduler(timezone="Asia/Tokyo")
