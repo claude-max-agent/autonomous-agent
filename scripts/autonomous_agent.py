@@ -13,6 +13,10 @@ LLM:
   - 日次アクション上限: 50回
   - 全アクションをDiscord通知
   - 破壊的操作（git push, file delete等）は実行しない
+
+チャンネル:
+  - hub-autonomous (DISCORD_CHANNEL_ID) : メインアクション結果の通知
+  - agent-diary   (DIARY_CHANNEL_ID)    : 思考プロセス・内省・独り言（Issue #9）
 """
 
 import os
@@ -26,7 +30,8 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 # ─── 設定 ──────────────────────────────────────────────────────────────────
 HUB_API_URL = os.getenv("HUB_API_URL", "http://localhost:8080")
-DISCORD_CHANNEL = os.getenv("DISCORD_CHANNEL_ID", "1475499842800451616")
+DISCORD_CHANNEL = os.getenv("DISCORD_CHANNEL_ID", "1475499842800451616")   # hub-autonomous
+DIARY_CHANNEL   = os.getenv("DIARY_CHANNEL_ID",   "1475552269222154312")   # agent-diary (Issue #9)
 AGENT_NAME = "autonomous-agent"
 MAX_DAILY_ACTIONS = 50
 
@@ -59,7 +64,7 @@ def get_today_topics() -> str:
 
 
 def notify_discord(message: str, is_alert: bool = False) -> None:
-    """Hub API 経由で Discord に通知"""
+    """hub-autonomous チャンネルにアクション結果を通知"""
     try:
         httpx.post(
             f"{HUB_API_URL}/api/v1/discord/reply",
@@ -72,6 +77,34 @@ def notify_discord(message: str, is_alert: bool = False) -> None:
         )
     except Exception as e:
         log.warning(f"Discord通知失敗: {e}")
+
+
+DIARY_EMOJI = {
+    "observe":  "👀",
+    "think":    "🤔",
+    "act":      "✍️",
+    "reflect":  "📝",
+    "daily":    "🌙",
+    "startup":  "🤖",
+    "error":    "⚠️",
+}
+
+def post_diary(content: str, step: str = "think") -> None:
+    """agent-diary チャンネルに思考プロセス・内省を投稿（Issue #9）"""
+    emoji = DIARY_EMOJI.get(step, "💭")
+    try:
+        httpx.post(
+            f"{HUB_API_URL}/api/v1/discord/reply",
+            json={
+                "channel_id": DIARY_CHANNEL,
+                "message": f"{emoji} **[{step}]** {content}",
+                "sender_name": AGENT_NAME,
+            },
+            timeout=10,
+        )
+        log.debug(f"Diary posted [{step}]: {content[:60]}")
+    except Exception as e:
+        log.warning(f"Diary投稿失敗: {e}")
 
 
 def count_action(label: str) -> bool:
@@ -157,6 +190,15 @@ def observe(topics: str) -> dict:
         "gh_repos": gh_repos,
     }
     log.info(f"HN: {len(hn_stories)}件, GitHub: {len(gh_repos)}件")
+
+    # agent-diary: 観察ログ
+    hn_titles = ", ".join(s["title"][:30] for s in hn_stories[:3]) if hn_stories else "なし"
+    gh_names  = ", ".join(r["name"].split("/")[-1] for r in gh_repos[:3]) if gh_repos else "なし"
+    post_diary(
+        f"トレンド収集完了\nトピック: {topics}\n"
+        f"HN注目: {hn_titles}\nGitHub注目: {gh_names}",
+        step="observe",
+    )
     return context
 
 
@@ -189,6 +231,9 @@ GitHub 注目リポジトリ:
     )
     theme = resp.content[0].text.strip()
     log.info(f"選定テーマ: {theme}")
+
+    # agent-diary: テーマ選定の思考プロセス
+    post_diary(f"{theme}", step="think")
     return theme
 
 
@@ -265,6 +310,20 @@ def reflect(draft: str, theme: str) -> dict:
     except Exception:
         result = {"total": 0, "comment": "評価パース失敗", "raw": text}
     log.info(f"自己評価: {result}")
+
+    # agent-diary: 内省ログ
+    total   = result.get("total", "?")
+    comment = result.get("comment", "")
+    coherence    = result.get("coherence", "?")
+    originality  = result.get("originality", "?")
+    readability  = result.get("readability", "?")
+    accuracy     = result.get("accuracy", "?")
+    post_diary(
+        f"自己評価スコア: {total}/100\n"
+        f"内訳: 一貫性{coherence} / 独自性{originality} / 読みやすさ{readability} / 正確性{accuracy}\n"
+        f"所感: {comment}",
+        step="reflect",
+    )
     return result
 
 
@@ -310,12 +369,23 @@ def daily_research():
     )
     log.info(f"=== 毎朝リサーチ完了: スコア{score} ===")
 
+    # agent-diary: 日次まとめ
+    post_diary(
+        f"本日のリサーチ完了\n"
+        f"テーマ: {theme}\n"
+        f"品質スコア: {score}/100\n"
+        f"所感: {comment}\n"
+        f"明日への改善点: {'独自考察を増やす' if isinstance(score, int) and score < 80 else 'このクオリティを維持'}",
+        step="daily",
+    )
+
 
 # ─── エントリポイント ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     log.info("autonomous_agent 起動")
     notify_discord("🤖 autonomous_agent が起動しました。毎朝 08:00 にリサーチを実行します。")
+    post_diary("起動しました。思考ログをここに記録していきます。", step="startup")
 
     scheduler = BlockingScheduler(timezone="Asia/Tokyo")
     scheduler.add_job(
@@ -338,3 +408,4 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         log.info("autonomous_agent 停止")
         notify_discord("🛑 autonomous_agent が停止しました。")
+        post_diary("停止します。またね。", step="startup")
