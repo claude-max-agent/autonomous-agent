@@ -150,23 +150,18 @@ def process_tweets(tweets: list[dict]) -> list[dict]:
 
 
 def get_chromadb_collection():
-    """Ollama bge-m3 embedding function付きのChromaDBコレクションを取得"""
+    """ChromaDBコレクションを取得（既存コレクションと一貫したデフォルトef使用）"""
     import chromadb
-    from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
-
-    ef = OllamaEmbeddingFunction(
-        url=OLLAMA_URL,
-        model_name=OLLAMA_MODEL,
-    )
 
     persist_dir = DATA_DIR / "embeddings" / "chromadb"
     persist_dir.mkdir(parents=True, exist_ok=True)
 
     client = chromadb.PersistentClient(path=str(persist_dir))
+    # 既存の personal_private コレクション（Chrome履歴2178件）はデフォルトefで作成済み。
+    # 一貫性を保つためefを指定せずデフォルト（all-MiniLM-L6-v2）を使用する。
     collection = client.get_or_create_collection(
         name=COLLECTION_PRIVATE,
         metadata={"hnsw:space": "cosine"},
-        embedding_function=ef,
     )
     return collection
 
