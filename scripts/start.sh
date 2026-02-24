@@ -18,8 +18,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 SESSION_NAME="autonomous-agent"
+DAEMON_SESSION="hub-autonomous"        # autonomous_agent.py デーモン用 tmux セッション
 LOG_DIR="$PROJECT_DIR/logs"
 ENV_FILE="$PROJECT_DIR/.env.autonomous"
+DAEMON_LOG="$LOG_DIR/daemon.log"
 
 # Colors
 RED='\033[0;31m'
@@ -183,30 +185,179 @@ show_logs() {
     fi
 }
 
+# =============================================================================
+# デーモン管理 (autonomous_agent.py - APScheduler 常駐プロセス)
+# tmux セッション: hub-autonomous
+# =============================================================================
+
+# デーモン起動コマンドを構築（op run 優先、フォールバックで .env 直接 source）
+build_daemon_cmd() {
+    local python_cmd="python3 $PROJECT_DIR/scripts/autonomous_agent.py"
+
+    # .env ファイル（op ref 形式なしのプレーンな値を想定）を優先
+    local env_plain="$PROJECT_DIR/.env"
+
+    if command -v op &>/dev/null && [ -f "$ENV_FILE" ]; then
+        # 1Password CLI 経由で環境変数を注入
+        echo "op run --env-file='$ENV_FILE' -- $python_cmd"
+    elif [ -f "$env_plain" ]; then
+        # .env から直接 source して起動
+        echo "bash -c 'set -a && source \"$env_plain\" && set +a && $python_cmd'"
+    elif [ -f "$ENV_FILE" ]; then
+        echo "bash -c 'set -a && source \"$ENV_FILE\" && set +a && $python_cmd'"
+    else
+        echo "$python_cmd"
+    fi
+}
+
+start_daemon() {
+    mkdir -p "$LOG_DIR"
+
+    if tmux has-session -t "$DAEMON_SESSION" 2>/dev/null; then
+        log_warn "デーモンセッション '$DAEMON_SESSION' は既に起動中です"
+        return 0
+    fi
+
+    log_step "autonomous_agent.py デーモンを起動: tmux:$DAEMON_SESSION ..."
+
+    # Ollama サーバーが起動していなければ起動
+    if ! curl -s http://localhost:11434/api/tags &>/dev/null; then
+        log_step "Ollama サーバーを起動..."
+        ollama serve >>"$LOG_DIR/ollama.log" 2>&1 &
+        sleep 3
+        if curl -s http://localhost:11434/api/tags &>/dev/null; then
+            log_info "Ollama 起動完了"
+        else
+            log_warn "Ollama 起動未確認（デーモンはClaude APIフォールバックで動作します）"
+        fi
+    else
+        log_info "Ollama 既に稼働中"
+    fi
+
+    # tmux セッション作成
+    tmux new-session -d -s "$DAEMON_SESSION" -c "$PROJECT_DIR" -x 200 -y 50
+
+    local daemon_cmd
+    daemon_cmd=$(build_daemon_cmd)
+
+    # ログリダイレクト付きで起動
+    tmux send-keys -t "$DAEMON_SESSION" \
+        "$daemon_cmd 2>&1 | tee -a '$DAEMON_LOG'" C-m
+
+    sleep 2
+
+    if tmux has-session -t "$DAEMON_SESSION" 2>/dev/null; then
+        log_info "デーモン起動完了 (tmux: $DAEMON_SESSION)"
+        echo ""
+        echo "  アタッチ: tmux attach -t $DAEMON_SESSION"
+        echo "  ログ:     tail -f $DAEMON_LOG"
+        echo "  停止:     $0 daemon-stop"
+    else
+        log_error "デーモンの起動に失敗しました"
+        exit 1
+    fi
+}
+
+stop_daemon() {
+    if tmux has-session -t "$DAEMON_SESSION" 2>/dev/null; then
+        tmux kill-session -t "$DAEMON_SESSION"
+        log_info "デーモン停止完了 ($DAEMON_SESSION)"
+    else
+        log_warn "デーモンセッション '$DAEMON_SESSION' は起動していません"
+    fi
+}
+
+show_daemon_status() {
+    echo ""
+    echo "=== Daemon Status (autonomous_agent.py) ==="
+    echo ""
+
+    if tmux has-session -t "$DAEMON_SESSION" 2>/dev/null; then
+        log_info "tmux: $DAEMON_SESSION (running)"
+        tmux list-panes -t "$DAEMON_SESSION" -F "  Pane #{pane_index}: #{pane_current_command}" 2>/dev/null
+    else
+        log_warn "tmux: $DAEMON_SESSION (not running)"
+    fi
+
+    # Ollama 確認
+    if curl -s http://localhost:11434/api/tags &>/dev/null; then
+        log_info "Ollama: running"
+    else
+        log_warn "Ollama: not running"
+    fi
+
+    echo ""
+    echo "  Log: $DAEMON_LOG"
+    if [ -f "$DAEMON_LOG" ]; then
+        echo ""
+        echo "  --- 最新ログ (5行) ---"
+        tail -5 "$DAEMON_LOG" | sed 's/^/  /'
+    fi
+    echo ""
+}
+
+install_cron() {
+    # @reboot エントリを crontab に追加
+    local daemon_cmd
+    daemon_cmd=$(build_daemon_cmd)
+    local cron_entry="@reboot sleep 10 && tmux new-session -d -s '$DAEMON_SESSION' -c '$PROJECT_DIR' \"$daemon_cmd 2>&1 | tee -a '$DAEMON_LOG'\""
+
+    if crontab -l 2>/dev/null | grep -q "$DAEMON_SESSION"; then
+        log_warn "crontab に既に @reboot エントリが存在します"
+        crontab -l | grep "$DAEMON_SESSION"
+    else
+        (crontab -l 2>/dev/null; echo "$cron_entry") | crontab -
+        log_info "@reboot cron エントリを追加しました:"
+        echo "  $cron_entry"
+    fi
+}
+
+remove_cron() {
+    if crontab -l 2>/dev/null | grep -q "$DAEMON_SESSION"; then
+        crontab -l | grep -v "$DAEMON_SESSION" | crontab -
+        log_info "crontab から @reboot エントリを削除しました"
+    else
+        log_warn "crontab に該当エントリが見つかりません"
+    fi
+}
+
 show_usage() {
     cat <<EOF
 Autonomous Agent Control Script
 
 Usage: $0 <command>
 
-Commands:
-  start     Start the autonomous agent (tmux session: $SESSION_NAME)
-  stop      Stop the agent
-  restart   Stop and restart
-  status    Show session status
-  attach    Attach to agent tmux session (full control)
-  watch     Watch agent session read-only
-  logs      Show startup logs
+=== Claude Code エージェント管理 ===
+  start          Claude Code エージェント起動 (tmux: $SESSION_NAME)
+  stop           Claude Code エージェント停止
+  restart        再起動
+  status         状態確認
+  attach         tmux セッションにアタッチ（フル制御）
+  watch          tmux セッションを読み取り専用で監視
+  logs           起動ログ表示
+
+=== デーモン管理 (autonomous_agent.py) ===
+  daemon-start   Python デーモン起動 (tmux: $DAEMON_SESSION)
+  daemon-stop    Python デーモン停止
+  daemon-restart Python デーモン再起動
+  daemon-status  Python デーモン状態確認
+  daemon-logs    デーモンログ表示 (tail -f)
+  daemon-attach  デーモン tmux セッションにアタッチ
+
+=== cron 管理 (@reboot 自動起動) ===
+  cron-install   @reboot cron エントリを追加（OS起動時に自動起動）
+  cron-remove    @reboot cron エントリを削除
 
 Environment:
-  .env.autonomous  API キーなどの環境変数ファイル
-                   op run --env-file=.env.autonomous 経由で注入される
+  .env.autonomous  op run 経由で API キーを注入
+  .env             op 未使用時のフォールバック
 
 Examples:
-  $0 start          # エージェント起動
-  $0 stop           # エージェント停止
-  $0 attach         # tmux セッションにアタッチ
-  $0 status         # 状態確認
+  $0 daemon-start          # デーモン起動
+  $0 daemon-stop           # デーモン停止
+  $0 daemon-status         # 状態確認
+  $0 cron-install          # OS起動時に自動起動を有効化
+  $0 daemon-logs           # ログをリアルタイム表示
 EOF
 }
 
@@ -225,6 +376,40 @@ case "${1:-}" in
         ;;
     status)
         show_status
+        ;;
+    daemon-start)
+        start_daemon
+        ;;
+    daemon-stop)
+        stop_daemon
+        ;;
+    daemon-restart)
+        stop_daemon
+        sleep 1
+        start_daemon
+        ;;
+    daemon-status)
+        show_daemon_status
+        ;;
+    daemon-logs)
+        if [ -f "$DAEMON_LOG" ]; then
+            tail -f "$DAEMON_LOG"
+        else
+            log_warn "ログファイルがありません: $DAEMON_LOG"
+        fi
+        ;;
+    daemon-attach)
+        if tmux has-session -t "$DAEMON_SESSION" 2>/dev/null; then
+            tmux attach -t "$DAEMON_SESSION"
+        else
+            log_error "デーモン未起動。Run: $0 daemon-start"
+        fi
+        ;;
+    cron-install)
+        install_cron
+        ;;
+    cron-remove)
+        remove_cron
         ;;
     attach)
         if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
