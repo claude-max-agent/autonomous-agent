@@ -29,6 +29,7 @@ from datetime import datetime, date
 
 import signal
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 import anthropic
@@ -43,10 +44,12 @@ CHAT_CHANNEL    = os.getenv("AGENT_CHAT_CHANNEL_ID", "1475867265110114379") # ag
 AGENT_NAME = "autonomous-agent"
 MAX_DAILY_ACTIONS = 50
 AGENT_CHAT_DIR = "/tmp/autonomous-agent-chat"  # Go APIがここにchatメッセージを書き込む
+AGENT_CHAT_PORT = int(os.getenv("AGENT_CHAT_PORT", "18400"))
 
 # Ollama設定（Issue #1: ローカルLLM）
 OLLAMA_URL   = os.getenv("OLLAMA_URL",   "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+OLLAMA_MODEL_CHAT = os.getenv("OLLAMA_MODEL_CHAT", "zono-agent:latest")
 
 # リサーチトピック（曜日で交互）
 # 月・水・金 = Web3, 火・木・土 = AI, 日 = 両方
@@ -413,10 +416,27 @@ def reflect(draft: str, theme: str) -> dict:
     return result
 
 
-# ─── agent-chat ハンドラ（Issue #18）────────────────────────────────────────
+# ─── agent-chat ハンドラ（Issue #18, #31）──────────────────────────────────
+
+def judge_importance(sender: str, message: str, response: str) -> float:
+    """Ollamaで会話の重要度を1-10で判定"""
+    prompt = f"""以下の会話の重要度を1〜10で評価してください（数字のみ返答）。
+重要度が高い条件: 技術的な洞察・重要な決定・個人的な関心事・将来参照する可能性
+
+会話:
+[{sender}]: {message}
+[応答]: {response[:300]}
+
+重要度（1〜10の整数のみ）:"""
+    try:
+        score_text = LocalLLM.generate(prompt, max_tokens=5)
+        return min(10.0, max(1.0, float(score_text.strip()[:3])))
+    except Exception:
+        return 5.0
+
 
 def chat_handler(message: str, sender: str, reply_channel_id: str) -> None:
-    """agent-chat チャンネルからのメッセージを qwen3:8b で処理して返信"""
+    """agent-chat チャンネルからのメッセージを zono-agent:latest で処理して返信（Issue #31）"""
     log.info(f"💬 chat_handler: {sender}: {message[:80]}")
 
     prompt = (
@@ -427,8 +447,20 @@ def chat_handler(message: str, sender: str, reply_channel_id: str) -> None:
 
     try:
         if LocalLLM.is_available():
-            response = LocalLLM.generate(prompt, max_tokens=800)
-            llm_label = f"qwen3:8b"
+            resp = httpx.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={
+                    "model": OLLAMA_MODEL_CHAT,
+                    "prompt": prompt,
+                    "stream": False,
+                    "think": False,
+                    "options": {"num_predict": 800, "temperature": 0.7},
+                },
+                timeout=120,
+            )
+            resp.raise_for_status()
+            response = resp.json()["response"].strip()
+            llm_label = OLLAMA_MODEL_CHAT
         else:
             # Claude Haiku フォールバック
             resp = client.messages.create(
@@ -459,14 +491,49 @@ def chat_handler(message: str, sender: str, reply_channel_id: str) -> None:
 
     post_diary(f"**{sender}**: {message[:100]}\n→ {response[:200]}", step="think")
 
-    # MemoryManager: 重要度フィルタリング後に保存
+    # MemoryManager: importance自動判定してChromaDB保存
     try:
         from memory_manager import MemoryManager
+        importance = judge_importance(sender, message, response)
+        log.info(f"chat importance: {importance}")
         mm = MemoryManager()
-        # chat保存（重要度5.0がデフォルト、Admin指定時は高く）
-        mm.add_chat(sender=sender, message=message, response=response, importance=5.0)
+        saved = mm.add_chat(sender=sender, message=message, response=response, importance=importance)
+        if saved:
+            log.info(f"chat saved to agent_memory (importance={importance})")
     except Exception as e:
         log.warning(f"memory_manager.add_chat失敗: {e}")
+
+
+class ChatHTTPHandler(BaseHTTPRequestHandler):
+    """POST /chat を受け付けてchat_handlerに委譲するHTTPハンドラ（Issue #31）"""
+
+    def do_POST(self):
+        if self.path != "/chat":
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length))
+        sender = body.get("sender", "Admin")
+        content = body.get("content", "")
+        channel_id = body.get("channel_id", CHAT_CHANNEL)
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+        # 別スレッドで処理（レスポンスを即返す）
+        threading.Thread(target=chat_handler, args=(content, sender, channel_id), daemon=True).start()
+
+    def log_message(self, format, *args):
+        log.debug(f"ChatHTTP: {format % args}")
+
+
+def start_chat_http_server():
+    """チャットHTTPサーバーをデーモンスレッドで起動"""
+    server = HTTPServer(("localhost", AGENT_CHAT_PORT), ChatHTTPHandler)
+    log.info(f"Chat HTTP server listening on localhost:{AGENT_CHAT_PORT}")
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server
 
 
 def poll_chat_messages() -> None:
@@ -678,7 +745,11 @@ if __name__ == "__main__":
     )
     log.info("heartbeat: 5分間隔で起動")
 
-    notify_discord(f"🤖 autonomous_agent が起動しました。{schedule_desc} にリサーチを実行します。\n{llm_status}\n💬 agent-chat: 30秒ポーリングで対話受付中")
+    # Chat HTTP サーバー起動（Go APIからのチャットを受け付ける）
+    start_chat_http_server()
+    log.info(f"チャットAPIサーバー起動: localhost:{AGENT_CHAT_PORT}")
+
+    notify_discord(f"🤖 autonomous_agent が起動しました。{schedule_desc} にリサーチを実行します。\n{llm_status}\n💬 agent-chat: 30秒ポーリングで対話受付中\n🌐 Chat API: localhost:{AGENT_CHAT_PORT}")
     post_diary("起動しました。思考ログをここに記録していきます。", step="startup")
 
     # 起動時に即時実行するオプション（テスト用）
