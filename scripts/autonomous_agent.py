@@ -474,8 +474,24 @@ def judge_importance(sender: str, message: str, response: str) -> float:
 
 
 def chat_handler(message: str, sender: str, reply_channel_id: str) -> None:
-    """agent-chat チャンネルからのメッセージを zono-agent:latest で処理して返信（Issue #31）"""
+    """agent-chat チャンネルからのメッセージを zono-agent:latest で処理して返信（Issue #31, #34）"""
     log.info(f"💬 chat_handler: {sender}: {message[:80]}")
+
+    # RAGコンテキスト取得（Issue #34: ChromaDB検索で応答強化）
+    rag_context = ""
+    try:
+        from memory_manager import MemoryManager
+        mm = MemoryManager()
+        rag_results = mm.search_context(message, n_results=3)
+        if rag_results:
+            rag_context = "\n\n## 関連する過去の記憶・知識\n"
+            for r in rag_results:
+                rag_context += f"- {r['content'][:200]}\n"
+            log.info(f"RAG検索: {len(rag_results)}件ヒット")
+    except Exception as e:
+        log.warning(f"RAG検索失敗（フォールバック）: {e}")
+
+    system_prompt = "あなたは @ZONO_819 です。" + rag_context
 
     prompt = (
         f"{sender} からメッセージが届きました。\n\n"
@@ -489,6 +505,7 @@ def chat_handler(message: str, sender: str, reply_channel_id: str) -> None:
                 f"{OLLAMA_URL}/api/generate",
                 json={
                     "model": OLLAMA_MODEL_CHAT,
+                    "system": system_prompt,
                     "prompt": prompt,
                     "stream": False,
                     "think": False,
@@ -500,10 +517,11 @@ def chat_handler(message: str, sender: str, reply_channel_id: str) -> None:
             response = resp.json()["response"].strip()
             llm_label = OLLAMA_MODEL_CHAT
         else:
-            # Claude Haiku フォールバック
+            # Claude Haiku フォールバック（RAGコンテキスト付き）
             resp = client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=800,
+                system=system_prompt,
                 messages=[{"role": "user", "content": prompt}],
             )
             response = resp.content[0].text.strip()

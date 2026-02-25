@@ -255,6 +255,28 @@ class MemoryManager:
 
         return doc_id
 
+    # ─── RAG検索 ─────────────────────────────────────────────────
+
+    def search_context(self, query: str, n_results: int = 3) -> list[dict]:
+        """personal_private + agent_memory をベクトル検索してRAGコンテキストを返す"""
+        import chromadb
+
+        if self._client is None:
+            self._client = chromadb.PersistentClient(path=str(self.persist_dir))
+
+        results = []
+        for col_name in ["personal_private", "agent_memory"]:
+            try:
+                col = self._client.get_collection(col_name)
+                res = col.query(query_texts=[query], n_results=n_results)
+                docs = res.get("documents", [[]])[0]
+                metas = res.get("metadatas", [[]])[0]
+                for doc, meta in zip(docs, metas):
+                    results.append({"content": doc, "meta": meta, "collection": col_name})
+            except Exception:
+                pass  # コレクション未存在やエラーは無視
+        return results
+
     # ─── ユーティリティ ────────────────────────────────────────────
 
     def stats(self) -> dict:
