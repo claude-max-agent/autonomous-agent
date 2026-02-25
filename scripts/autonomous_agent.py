@@ -22,10 +22,12 @@ LLM（ハイブリッド構成 - Issue #1）:
 """
 
 import os
+import re
 import glob
 import json
 import logging
-from datetime import datetime, date
+import subprocess
+from datetime import datetime, date, timezone, timedelta
 
 import signal
 import threading
@@ -35,6 +37,8 @@ import httpx
 import anthropic
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.executors.pool import ThreadPoolExecutor
+
+JST = timezone(timedelta(hours=9))
 
 # ─── 設定 ──────────────────────────────────────────────────────────────────
 HUB_API_URL = os.getenv("HUB_API_URL", "http://localhost:8080")
@@ -416,6 +420,40 @@ def reflect(draft: str, theme: str) -> dict:
     return result
 
 
+# ─── Zenn自動草稿コミット（Issue #33）───────────────────────────────────────
+
+def commit_draft_to_zenn(draft: str, theme: str, score: int) -> bool:
+    """Zenn記事草稿をzenn-contentリポジトリにコミット・プッシュ"""
+    zenn_dir = os.path.expanduser("~/zenn-content")
+    today = datetime.now(JST).strftime("%Y-%m-%d")
+    slug = re.sub(r"[^\w\-]", "-", theme.lower())[:20].strip("-")
+    filename = f"{today}-{slug}.md"
+    filepath = os.path.join(zenn_dir, "articles", filename)
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(draft)
+        subprocess.run(
+            ["git", "add", filename],
+            cwd=os.path.join(zenn_dir, "articles"),
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", f"bot: auto-draft {today} {theme[:30]}"],
+            cwd=zenn_dir,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "push", "origin", "main"],
+            cwd=zenn_dir,
+            check=True,
+        )
+        log.info(f"Zenn草稿コミット成功: {filename}")
+        return True
+    except Exception as e:
+        log.error(f"commit_draft_to_zenn失敗: {e}")
+        return False
+
+
 # ─── agent-chat ハンドラ（Issue #18, #31）──────────────────────────────────
 
 def judge_importance(sender: str, message: str, response: str) -> float:
@@ -608,6 +646,19 @@ def daily_research():
             mm.add_research(date=today, topic=topics, theme=theme, score=score if isinstance(score, (int, float)) else 0, summary=evaluation.get("comment", ""))
         except Exception as e:
             log.warning(f"memory_manager.add_research失敗: {e}")
+
+        # Zenn草稿コミット（Issue #33: スコア >= 60 のみ）
+        if isinstance(score, (int, float)) and score >= 60:
+            zenn_today = datetime.now(JST).strftime("%Y-%m-%d")
+            zenn_slug = re.sub(r"[^\w\-]", "-", theme.lower())[:20].strip("-")
+            zenn_filename = f"{zenn_today}-{zenn_slug}.md"
+            if commit_draft_to_zenn(draft, theme, int(score)):
+                github_url = f"https://github.com/claude-max-agent/zenn-content/blob/main/articles/{zenn_filename}"
+                notify_discord(f"📝 Zenn草稿をコミットしました\n{github_url}")
+            else:
+                notify_discord(f"⚠️ Zenn草稿のコミットに失敗しました（スコア: {score}/100）", is_alert=True)
+        elif isinstance(score, (int, float)):
+            notify_discord(f"📝 草稿スコア不足でZennコミットをスキップ ({score}/100)")
 
         # notify
         comment = evaluation.get("comment", "")
