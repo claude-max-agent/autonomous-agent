@@ -459,11 +459,12 @@ def chat_handler(message: str, sender: str, reply_channel_id: str) -> None:
 
     post_diary(f"**{sender}**: {message[:100]}\n→ {response[:200]}", step="think")
 
-    # MemoryManager: 重要度フィルタリング後に保存
+    # ─── MemoryManager: 重要度フィルタ後に会話を保存（Issue #27）─────
     try:
+        import sys, os
+        sys.path.insert(0, os.path.dirname(__file__))
         from memory_manager import MemoryManager
         mm = MemoryManager()
-        # chat保存（重要度5.0がデフォルト、Admin指定時は高く）
         mm.add_chat(sender=sender, message=message, response=response, importance=5.0)
     except Exception as e:
         log.warning(f"memory_manager.add_chat失敗: {e}")
@@ -531,18 +532,24 @@ def daily_research():
         # reflect
         evaluation = reflect(draft, theme)
 
-        # MemoryManager: リサーチログを蓄積
-        score = evaluation.get("total", "?")
+        # ─── MemoryManager: リサーチログを蓄積（Issue #27）────────
         try:
+            import sys, os
+            sys.path.insert(0, os.path.dirname(__file__))
             from memory_manager import MemoryManager
             mm = MemoryManager()
-            # reflect scoreをimportanceに変換（100点満点→10点満点）
-            importance = min(10.0, max(1.0, score / 10.0)) if isinstance(score, (int, float)) else 5.0
-            mm.add_research(date=today, topic=topics, theme=theme, score=score if isinstance(score, (int, float)) else 0, summary=evaluation.get("comment", ""))
+            mm.add_research(
+                date=today,
+                topic=topics,
+                theme=theme,
+                score=evaluation.get("total", 50) if isinstance(evaluation.get("total"), (int, float)) else 50,
+                summary=evaluation.get("comment", ""),
+            )
         except Exception as e:
             log.warning(f"memory_manager.add_research失敗: {e}")
 
         # notify
+        score = evaluation.get("total", "?")
         comment = evaluation.get("comment", "")
         notify_discord(
             f"✅ 本日のリサーチ投稿完了\n"
@@ -572,16 +579,24 @@ def daily_research():
 
 # ─── ヘルスチェック ─────────────────────────────────────────────────────────
 
-def weekly_memory_cleanup():
-    """週次メモリクリーンアップ: TTL切れ削除 + Ollama要約生成"""
-    from memory_manager import MemoryManager
+def weekly_memory_cleanup() -> None:
+    """週次メモリクリーンアップ（毎週日曜03:00 JST）"""
+    log.info("=== 週次メモリクリーンアップ開始 ===")
     try:
+        import sys, os
+        sys.path.insert(0, os.path.dirname(__file__))
+        from memory_manager import MemoryManager
         mm = MemoryManager()
-        mm.cleanup()
-        mm.summarize_week()
-        log.info("週次メモリクリーンアップ完了")
+        stats = mm.cleanup()
+        log.info(f"cleanup完了: {stats}")
+        summary_id = mm.summarize_week()
+        if summary_id:
+            log.info(f"週次要約作成: id={summary_id}")
+        else:
+            log.info("週次要約: 対象なし or Ollama未稼働")
     except Exception as e:
         log.error(f"週次メモリクリーンアップ失敗: {e}")
+    log.info("=== 週次メモリクリーンアップ完了 ===")
 
 
 def scheduler_heartbeat():
@@ -656,7 +671,17 @@ if __name__ == "__main__":
     )
     log.info("agent-chat ポーリング: 30秒間隔で起動")
 
-    # 週次メモリクリーンアップ: 毎週日曜03:00 JST
+    # ヘルスチェック: 5分ごとにスレッド数をログ出力
+    scheduler.add_job(
+        scheduler_heartbeat,
+        trigger="interval",
+        minutes=5,
+        id="heartbeat",
+        name="スケジューラ heartbeat",
+    )
+    log.info("heartbeat: 5分間隔で起動")
+
+    # 週次メモリクリーンアップ: 毎週日曜03:00 JST（Issue #27）
     scheduler.add_job(
         weekly_memory_cleanup,
         trigger="cron",
@@ -667,16 +692,6 @@ if __name__ == "__main__":
         name="週次メモリクリーンアップ",
     )
     log.info("週次メモリクリーンアップ: 毎週日曜 03:00 JST")
-
-    # ヘルスチェック: 5分ごとにスレッド数をログ出力
-    scheduler.add_job(
-        scheduler_heartbeat,
-        trigger="interval",
-        minutes=5,
-        id="heartbeat",
-        name="スケジューラ heartbeat",
-    )
-    log.info("heartbeat: 5分間隔で起動")
 
     notify_discord(f"🤖 autonomous_agent が起動しました。{schedule_desc} にリサーチを実行します。\n{llm_status}\n💬 agent-chat: 30秒ポーリングで対話受付中")
     post_diary("起動しました。思考ログをここに記録していきます。", step="startup")
